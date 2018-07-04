@@ -1,6 +1,9 @@
 carbon-udp
 =============
 
+[![GoDoc](https://godoc.org/github.com/edadeal/carbon-udp?status.svg)](https://godoc.org/github.com/edadeal/carbon-udp)
+[![Go Report Card](https://goreportcard.com/badge/github.com/edadeal/carbon-udp)](https://goreportcard.com/report/github.com/edadeal/carbon-udp)
+
 # What is carbon-udp?
 
 A pure Go library to make it easier to send application metrics to a Carbon server.

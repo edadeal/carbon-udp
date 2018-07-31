@@ -21,3 +21,7 @@ func (m Metric) String() string {
 func (m Metric) aggregationKey() string {
 	return m.Name + strconv.FormatInt(m.Time.Unix(), 10)
 }
+
+func (m Metric) IsEmpty() bool {
+	return m.Name == ""
+}

@@ -5,6 +5,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -15,6 +16,8 @@ type Conn struct {
 	dialTimeout time.Duration
 	verbose     bool
 	prefix      string
+	wg          *sync.WaitGroup
+	closing     chan struct{}
 }
 
 // WithTimeout controls time to connect to Carbon server.
@@ -55,7 +58,11 @@ func makePrefix(prefixes ...string) (prefix string) {
 
 // Dial returns new Carbon connection.
 func Dial(address string, opts ...func(*Conn)) (*Conn, error) {
-	var conn Conn
+	conn := Conn{
+		wg:      &sync.WaitGroup{},
+		closing: make(chan struct{}),
+	}
+
 	for _, opt := range opts {
 		opt(&conn)
 	}
@@ -73,6 +80,10 @@ func Dial(address string, opts ...func(*Conn)) (*Conn, error) {
 // closes underlying Carbon connection.
 func (c *Conn) Close() error {
 	c.log("Closing UDP connection")
+
+	c.log("Waiting for all aggregations to flush")
+	close(c.closing)
+	c.wg.Wait()
 	return c.nc.Close()
 }
 
@@ -92,6 +103,7 @@ func (c *Conn) Write(metrics ...Metric) error {
 func (c *Conn) NewAggregation(flushInterval time.Duration, fn AggregationFunc, prefixes ...string) chan<- Metric {
 	c.log("Creating new aggregation channel with interval %s", flushInterval)
 	fc := make(chan Metric)
+	c.wg.Add(1)
 
 	prefix := makePrefix(prefixes...)
 
@@ -100,35 +112,55 @@ func (c *Conn) NewAggregation(flushInterval time.Duration, fn AggregationFunc, p
 		flushTicker := time.NewTicker(flushInterval)
 
 		defer flushTicker.Stop()
+		defer c.wg.Done()
 
 		c.log("Starting flush cicle (every %v)", flushInterval)
 		for {
 			select {
-			case metric := <-fc:
-				key := metric.aggregationKey()
-				c.log("Metric received through channel: %+v. Key: %+v", metric, key)
-				metric.Name = prefix + metric.Name
-				metrics[key] = append(metrics[key], metric)
+			case metric, ok := <-fc:
+				if !metric.IsEmpty() {
+					key := metric.aggregationKey()
+					c.log("Metric received through channel: %+v. Key: %+v", metric, key)
+					metric.Name = prefix + metric.Name
+					metrics[key] = append(metrics[key], metric)
+				}
+				// flush on channel close
+				if !ok {
+					c.log("Force flushing aggregated metrics after channel close")
+					aggregateAndFlush(c, metrics, fn)
+					return
+				}
 
 			case <-flushTicker.C:
-				c.log("Aggregating and flattening metrics")
-				fm := make([]Metric, 0, len(metrics))
-				for k := range metrics {
-					if len(metrics[k]) > 0 {
-						fm = append(fm, fn(metrics[k]))
-					}
-				}
-
-				c.log("Pushing %d aggregated metrics to carbon: %+v", len(fm), fm)
-				if err := c.Write(fm...); err != nil {
-					c.log("An error occured while pushing metrics in flush loop: %s", err)
-				}
-
+				aggregateAndFlush(c, metrics, fn)
 				c.log("Cleaning up metrics batch")
 				metrics = make(map[string][]Metric)
+
+			case _, ok := <-c.closing:
+				if !ok {
+					c.log("Force flushing aggregated metrics before connection close")
+					aggregateAndFlush(c, metrics, fn)
+					return
+				}
 			}
+
 		}
 	}()
 
 	return fc
+}
+
+func aggregateAndFlush(conn *Conn, metrics map[string][]Metric, fn AggregationFunc) {
+	conn.log("Aggregating and flattening metrics")
+	fm := make([]Metric, 0, len(metrics))
+	for k := range metrics {
+		if len(metrics[k]) > 0 {
+			fm = append(fm, fn(metrics[k]))
+		}
+	}
+
+	conn.log("Pushing %d aggregated metrics to carbon: %+v", len(fm), fm)
+	if err := conn.Write(fm...); err != nil {
+		conn.log("An error occured while pushing metrics in flush loop: %s", err)
+	}
 }
